@@ -6,7 +6,7 @@
 
 - **Stdlib only** — zero third-party dependencies, just Go + `net/http`.
 - **Stateless bridge** — Telconyx does not store anything. You save the link in your own database.
-- **Chunked uploads** — files of any size up to your configured limit are split into 49 MB chunks and reassembled in parallel on download.
+- **Chunked uploads** — files larger than the configurable chunk size (`ChunkSize`, default 49 MB, max 50 MB) are split into multiple parts and reassembled in parallel on download.
 - **One binary, two modes** — `import` as a Go library, or run as an HTTP service on `:9090`.
 - **Tiny Docker image** — multi-stage build, distroless base, ~8 MB.
 - **Resilient** — built-in flood-wait retry, exponential backoff with jitter, context cancellation, per-chunk retry.
