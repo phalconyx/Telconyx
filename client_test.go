@@ -144,6 +144,12 @@ func TestFileLink_ChunkedEncodeDecode(t *testing.T) {
 			t.Errorf("chunk %d FileID: got %q, want %q", i, parsed.Chunks[i].FileID, ch.FileID)
 		}
 	}
+	// message_ids must round-trip too (required to delete every chunk)
+	for i, ch := range original.Chunks {
+		if parsed.Chunks[i].MessageID != ch.MessageID {
+			t.Errorf("chunk %d MessageID: got %d, want %d", i, parsed.Chunks[i].MessageID, ch.MessageID)
+		}
+	}
 }
 
 func TestFileLink_AllChunks_Legacy(t *testing.T) {

@@ -50,10 +50,12 @@ type linkPayload struct {
 	N string `json:"n,omitempty"`
 
 	// Chunking. F is the first chunk's file_id; CK contains file_ids for all
-	// chunks (including the first, for simplicity). Only emitted when CC > 1.
+	// chunks (including the first, for simplicity), and CM the matching Telegram
+	// message_ids (needed to delete every chunk). Only emitted when CC > 1.
 	CS int      `json:"cs,omitempty"`
 	CC int      `json:"cc,omitempty"`
 	CK []string `json:"ck,omitempty"`
+	CM []int    `json:"cm,omitempty"`
 }
 
 func encodeLink(l *FileLink) (string, error) {
@@ -76,8 +78,10 @@ func encodeLink(l *FileLink) (string, error) {
 		p.CS = l.ChunkSize
 		p.CC = n
 		p.CK = make([]string, 0, n)
+		p.CM = make([]int, 0, n)
 		for _, ch := range l.Chunks {
 			p.CK = append(p.CK, ch.FileID)
+			p.CM = append(p.CM, ch.MessageID)
 		}
 	}
 	b, err := json.Marshal(p)
@@ -150,13 +154,20 @@ func ParseURL(s string) (*FileLink, error) {
 		l.ChunkSize = p.CS
 		l.ChunkCount = p.CC
 		l.Chunks = make([]ChunkRef, p.CC)
+		hasMsgIDs := len(p.CM) == p.CC
 		for i, fid := range p.CK {
 			l.Chunks[i] = ChunkRef{
 				Index:  i,
 				FileID: fid,
 			}
+			if hasMsgIDs {
+				l.Chunks[i].MessageID = p.CM[i]
+			}
 			if i == 0 {
-				l.Chunks[i].MessageID = p.M
+				// Legacy links (no CM) still carry the first chunk's id in M.
+				if l.Chunks[i].MessageID == 0 {
+					l.Chunks[i].MessageID = p.M
+				}
 				l.Chunks[i].Size = p.S
 			}
 		}

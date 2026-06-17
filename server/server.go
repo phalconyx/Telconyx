@@ -5,6 +5,7 @@
 //	GET  /health     - liveness check
 //	POST /upload     - multipart upload, returns FileLink JSON
 //	POST /download   - JSON body {"url": "telconyx://..."}, streams file bytes
+//	POST /delete     - JSON body {"url": "telconyx://..."}, deletes the file's Telegram message(s)
 package server
 
 import (
@@ -42,6 +43,7 @@ func New(c *telconyx.Client, cfg Config) http.Handler {
 	mux.HandleFunc("GET /health", h.health)
 	mux.HandleFunc("POST /upload", h.upload)
 	mux.HandleFunc("POST /download", h.download)
+	mux.HandleFunc("POST /delete", h.delete)
 	return mux
 }
 
@@ -177,6 +179,54 @@ func (h *handler) download(w http.ResponseWriter, r *http.Request) {
 		// The client will see a truncated response.
 		return
 	}
+}
+
+// delete removes the Telegram message(s) backing a telconyx:// file. For chunked
+// files every part is deleted. Requires a numeric TELCONYX_CHAT_ID.
+func (h *handler) delete(w http.ResponseWriter, r *http.Request) {
+	if !h.auth(w, r) {
+		return
+	}
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid json body: %v", err))
+		return
+	}
+	if strings.TrimSpace(req.URL) == "" {
+		writeError(w, http.StatusBadRequest, "missing 'url' field")
+		return
+	}
+	link, err := telconyx.ParseURL(req.URL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Count parts whose message id is known (legacy links only carry the first).
+	chunks := link.AllChunks()
+	deletable := 0
+	for _, ch := range chunks {
+		if ch.MessageID != 0 {
+			deletable++
+		}
+	}
+
+	if err := h.client.DeleteChunks(r.Context(), link); err != nil {
+		// Some messages may already have been deleted before the failure.
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success":          true,
+		"deleted_messages": deletable,
+		"total_chunks":     len(chunks),
+		"skipped":          len(chunks) - deletable,
+	})
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {

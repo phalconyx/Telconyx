@@ -170,6 +170,33 @@ curl -X POST http://localhost:9090/download \
 
 Response: the file bytes, with `Content-Type`, `Content-Disposition: attachment; filename="..."` and (for chunked files) `X-Telconyx-Chunks: N` headers when known. The real filename and type come from these headers — the output filename you pass to curl (`-o`) is just a local choice and does not have to match.
 
+`POST /delete` (application/json)
+
+```bash
+curl -X POST http://localhost:9090/delete \
+  -H "X-API-Key: $TELCONYX_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"telconyx://file/eyJmIjoiLi4uIn0="}'
+```
+
+Response `200 OK`:
+
+```json
+{
+  "success": true,
+  "deleted_messages": 3,
+  "total_chunks": 3,
+  "skipped": 0
+}
+```
+
+Deletes the Telegram message(s) backing the file. For chunked files every part is removed. Notes:
+
+- Requires a **numeric** `TELCONYX_CHAT_ID` (not `@username`) — otherwise the request returns an error.
+- The bot can only delete its own messages, and Telegram only allows deletion within a limited window (commonly ~48 hours); older files may return `400 Bad Request: message can't be deleted`.
+- `skipped` counts parts whose Telegram message id is not stored in the link. Links created before this feature only carry the **first** chunk's message id, so only that part can be deleted — re-upload to get a fully deletable link.
+- On failure some parts may already have been deleted (deletion is attempted for every part; the first error is returned).
+
 ## Chunking
 
 Telegram's Bot API caps each file at **50 MB** for `sendDocument`. Telconyx automatically splits larger files into chunks of `ChunkSize` bytes (default 49 MB to leave headroom for multipart overhead) and uploads each as a separate message.
@@ -193,7 +220,7 @@ if err := client.DeleteChunks(ctx, link); err != nil {
 }
 ```
 
-`DeleteChunks` requires a numeric `ChatID` (not `@groupusername`) and deletes every message referenced in the link. After cleanup, retry the upload.
+`DeleteChunks` requires a numeric `ChatID` (not `@groupusername`) and deletes every message referenced in the link. After cleanup, retry the upload. The same operation is exposed over HTTP as `POST /delete` (see [HTTP API](#http-api-server-mode)).
 
 ## Limits
 
