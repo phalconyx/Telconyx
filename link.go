@@ -164,7 +164,16 @@ func ParseURL(s string) (*FileLink, error) {
 		Name:         p.N,
 		Route:        p.R,
 	}
-	if p.CC > 1 && len(p.CK) == p.CC {
+	if p.CC > 1 {
+		// Corrupt chunk metadata must be an error, not a silent fallback:
+		// treating such a link as a single file would "successfully" download
+		// only the first chunk and hand the caller a truncated file.
+		if len(p.CK) != p.CC {
+			return nil, fmt.Errorf("%w: chunk_count=%d but %d chunk file_ids", ErrInvalidLink, p.CC, len(p.CK))
+		}
+		if len(p.CM) != 0 && len(p.CM) != p.CC {
+			return nil, fmt.Errorf("%w: chunk_count=%d but %d chunk message_ids", ErrInvalidLink, p.CC, len(p.CM))
+		}
 		l.ChunkSize = p.CS
 		l.ChunkCount = p.CC
 		l.Chunks = make([]ChunkRef, p.CC)
@@ -177,12 +186,11 @@ func ParseURL(s string) (*FileLink, error) {
 			if hasMsgIDs {
 				l.Chunks[i].MessageID = p.CM[i]
 			}
-			if i == 0 {
-				// Legacy links (no CM) still carry the first chunk's id in M.
-				if l.Chunks[i].MessageID == 0 {
-					l.Chunks[i].MessageID = p.M
-				}
-				l.Chunks[i].Size = p.S
+			// Legacy links (no CM) still carry the first chunk's id in M.
+			// Per-chunk sizes are not stored in the URL; ChunkRef.Size stays 0
+			// for parsed links and download uses ChunkSize as the bound.
+			if i == 0 && l.Chunks[i].MessageID == 0 {
+				l.Chunks[i].MessageID = p.M
 			}
 		}
 	}

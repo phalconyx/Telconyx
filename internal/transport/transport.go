@@ -8,11 +8,15 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
+
+// DefaultAPIBase is the hosted Telegram Bot API endpoint.
+const DefaultAPIBase = "https://api.telegram.org"
 
 // Response is a buffered HTTP response.
 type Response struct {
@@ -32,25 +36,54 @@ type StreamResponse struct {
 // Client is a thin wrapper around net/http for the Telegram Bot API.
 type Client struct {
 	http    *http.Client
+	base    string
 	apiBase string
 	token   string
 }
 
-// New returns a new transport client.
-func New(token string, timeout time.Duration) *Client {
+// New returns a new transport client. base is the API server root
+// (DefaultAPIBase when empty; a self-hosted telegram-bot-api server otherwise).
+//
+// timeout bounds the connection phases (dial, TLS) and the wait for response
+// headers — it deliberately does NOT bound body transfer, so large uploads
+// and downloads on slow links are never cut off mid-stream. Callers bound
+// whole operations with a context deadline when they need one.
+func New(token string, timeout time.Duration, base string) *Client {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
+	base = strings.TrimRight(base, "/")
+	if base == "" {
+		base = DefaultAPIBase
+	}
+	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		// Counted from the end of the request write, so an upload that takes
+		// minutes to send is not affected — this only bounds how long the API
+		// may think before answering.
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: 1 * time.Second,
+		// Keep at least as many idle conns as concurrent chunk transfers so
+		// parallel downloads don't churn TLS handshakes.
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     90 * time.Second,
+	}
 	return &Client{
-		http:    &http.Client{Timeout: timeout},
-		apiBase: "https://api.telegram.org/bot" + token,
+		http:    &http.Client{Transport: tr},
+		base:    base,
+		apiBase: base + "/bot" + token,
 		token:   token,
 	}
 }
 
 // FileURL builds the temporary download URL for a Telegram file path.
 func (c *Client) FileURL(filePath string) string {
-	return "https://api.telegram.org/file/bot" + c.token + "/" + filePath
+	return c.base + "/file/bot" + c.token + "/" + filePath
 }
 
 // Close releases any idle HTTP connections.

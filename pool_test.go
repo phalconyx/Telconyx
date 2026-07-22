@@ -342,7 +342,7 @@ func TestPartialChunkLink(t *testing.T) {
 		{Index: 0, FileID: "fid0", MessageID: 100, Size: 10},
 		{Index: 1, FileID: "fid1", MessageID: 101, Size: 10},
 	}
-	l := partialChunkLink(first, chunks, "big.bin")
+	l := partialChunkLink(first, chunks, "big.bin", 10)
 	all := l.AllChunks()
 	if len(all) != 2 {
 		t.Fatalf("AllChunks: got %d, want 2", len(all))
@@ -350,9 +350,12 @@ func TestPartialChunkLink(t *testing.T) {
 	if all[1].MessageID != 101 {
 		t.Errorf("chunk 1 message id: got %d, want 101", all[1].MessageID)
 	}
+	if l.ChunkSize != 10 {
+		t.Errorf("ChunkSize: got %d, want 10", l.ChunkSize)
+	}
 
 	// Single uploaded chunk: falls back to top-level fields.
-	l1 := partialChunkLink(first, chunks[:1], "big.bin")
+	l1 := partialChunkLink(first, chunks[:1], "big.bin", 10)
 	all1 := l1.AllChunks()
 	if len(all1) != 1 || all1[0].MessageID != 100 {
 		t.Errorf("single-chunk partial link wrong: %+v", all1)

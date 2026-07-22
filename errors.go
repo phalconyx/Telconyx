@@ -46,18 +46,27 @@ type NonRetryableError struct {
 	Reason string
 	// Detail is an optional snippet of the server response for debugging.
 	Detail string
+	// Err is the optional underlying cause, preserved for errors.Is/As.
+	Err error
 }
 
 func (e *NonRetryableError) Error() string {
+	msg := ""
 	switch {
 	case e.Method != "" && e.Detail != "":
-		return fmt.Sprintf("telconyx: %s: %s (non-retryable; server said: %s)", e.Method, e.Reason, e.Detail)
+		msg = fmt.Sprintf("telconyx: %s: %s (non-retryable; server said: %s)", e.Method, e.Reason, e.Detail)
 	case e.Method != "":
-		return fmt.Sprintf("telconyx: %s: %s (non-retryable)", e.Method, e.Reason)
+		msg = fmt.Sprintf("telconyx: %s: %s (non-retryable)", e.Method, e.Reason)
 	default:
-		return fmt.Sprintf("telconyx: %s (non-retryable)", e.Reason)
+		msg = fmt.Sprintf("telconyx: %s (non-retryable)", e.Reason)
 	}
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
 }
+
+func (e *NonRetryableError) Unwrap() error { return e.Err }
 
 // PartialUploadError reports a chunked upload that failed after at least one
 // chunk was already sent to the chat. Link references the sent chunks so they

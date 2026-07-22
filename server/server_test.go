@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -96,6 +97,45 @@ func TestUnknownRoute(t *testing.T) {
 				t.Errorf("expected unknown_route error code, got %s", w.Body.String())
 			}
 		})
+	}
+}
+
+// TestDownload_PreStreamErrorReturnsJSON verifies that a download failing
+// before the first body byte (e.g. expired file_id) produces a proper JSON
+// error envelope instead of an empty 200 with stale file headers.
+func TestDownload_PreStreamErrorReturnsJSON(t *testing.T) {
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/getFile") {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: file is too big"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer fake.Close()
+
+	c, err := telconyx.NewClient(telconyx.Config{Token: "t", ChatID: "-100", APIBase: fake.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(c, Config{})
+
+	link := (&telconyx.FileLink{FileID: "fid", Size: 10, Name: "x.bin", MimeType: "text/html"}).URL()
+	w := do(h, "POST", "/download", `{"url":"`+link+`"}`)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("got %d, want 502 (body=%s)", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "download_failed") {
+		t.Errorf("expected download_failed code, got %s", w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json (stale file headers must be cleared)", ct)
+	}
+	if cd := w.Header().Get("Content-Disposition"); cd != "" {
+		t.Errorf("stale Content-Disposition survived: %q", cd)
+	}
+	if cl := w.Header().Get("Content-Length"); cl == "10" {
+		t.Errorf("stale Content-Length survived: %q", cl)
 	}
 }
 

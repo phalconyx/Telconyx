@@ -21,6 +21,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,13 +29,22 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/phalconyx/telconyx"
 )
+
+// multipartMemory is the in-memory budget for parsing multipart forms; file
+// parts beyond it spill to temp files. It must stay small — passing the full
+// upload limit here would buffer whole uploads in RAM.
+const multipartMemory = 32 << 20
+
+// multipartOverhead is slack added on top of MaxUploadBytes for multipart
+// boundaries, part headers, and small extra fields (e.g. caption), so a file
+// of exactly MaxUploadBytes still fits in the request body.
+const multipartOverhead = 1 << 20
 
 // Config is the server configuration.
 type Config struct {
@@ -81,7 +91,7 @@ func (h *handler) auth(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	got := r.Header.Get("X-API-Key")
-	if got == "" || got != h.cfg.APIKey {
+	if subtle.ConstantTimeCompare([]byte(got), []byte(h.cfg.APIKey)) != 1 {
 		writeError(w, r, http.StatusUnauthorized, "unauthorized", "missing or invalid X-API-Key")
 		return false
 	}
@@ -99,8 +109,8 @@ func (h *handler) upload(w http.ResponseWriter, r *http.Request) {
 	if !h.auth(w, r) {
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxUploadBytes)
-	if err := r.ParseMultipartForm(h.cfg.MaxUploadBytes); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxUploadBytes+multipartOverhead)
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
 		writeError(w, r, http.StatusBadRequest, "invalid_multipart", fmt.Sprintf("invalid multipart form: %v", err))
 		return
 	}
@@ -111,33 +121,29 @@ func (h *handler) upload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// Save the multipart body to a temp file. This is required to support
-	// chunked uploads for files larger than the Bot API 50 MB limit.
-	ext := filepath.Ext(header.Filename)
-	tmp, err := os.CreateTemp("", "telconyx-upload-*"+ext)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "internal", fmt.Sprintf("create temp file: %v", err))
-		return
+	// The chunked upload path needs a seekable *os.File. Parts larger than
+	// multipartMemory were already spilled to a temp file during parsing
+	// (net/http removes it after the handler returns) — use it directly.
+	// Small in-memory parts are copied out to a temp file of our own.
+	src, ok := file.(*os.File)
+	if !ok {
+		tmp, err := os.CreateTemp("", "telconyx-upload-*")
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "internal", fmt.Sprintf("create temp file: %v", err))
+			return
+		}
+		defer os.Remove(tmp.Name())
+		defer tmp.Close()
+		if _, err := io.Copy(tmp, file); err != nil {
+			writeError(w, r, http.StatusInternalServerError, "internal", fmt.Sprintf("write temp file: %v", err))
+			return
+		}
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+			writeError(w, r, http.StatusInternalServerError, "internal", fmt.Sprintf("rewind temp file: %v", err))
+			return
+		}
+		src = tmp
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-
-	written, err := io.Copy(tmp, file)
-	if cerr := tmp.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "internal", fmt.Sprintf("write temp file: %v", err))
-		return
-	}
-
-	// Re-open for the chunked upload path; UploadFileHandle seeks into the file.
-	src, err := os.Open(tmpPath)
-	if err != nil {
-		writeError(w, r, http.StatusInternalServerError, "internal", fmt.Sprintf("reopen temp file: %v", err))
-		return
-	}
-	defer src.Close()
 
 	opts := telconyx.UploadOpts{
 		Name:     header.Filename,
@@ -145,8 +151,12 @@ func (h *handler) upload(w http.ResponseWriter, r *http.Request) {
 		MimeType: header.Header.Get("Content-Type"),
 	}
 
-	result, err := h.store.UploadFileHandle(r.Context(), src, written, opts)
+	result, err := h.store.UploadFileHandle(r.Context(), src, header.Size, opts)
 	if err != nil {
+		if errors.Is(err, telconyx.ErrUploadTooLarge) {
+			writeError(w, r, http.StatusRequestEntityTooLarge, "upload_too_large", err.Error())
+			return
+		}
 		writeError(w, r, http.StatusBadGateway, "upload_failed", err.Error())
 		return
 	}
@@ -186,24 +196,52 @@ func (h *handler) download(w http.ResponseWriter, r *http.Request) {
 		writeUnresolvable(w, r, err)
 		return
 	}
-	if link.MimeType != "" {
-		w.Header().Set("Content-Type", link.MimeType)
+	// The link is untrusted input: always declare an explicit content type
+	// and force attachment disposition so a crafted text/html link can never
+	// be rendered in a browser on this origin.
+	ct := link.MimeType
+	if ct == "" {
+		ct = "application/octet-stream"
 	}
-	if link.Name != "" {
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeFilename(link.Name)))
-	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeFilename(link.Name)))
 	if link.Size > 0 {
 		w.Header().Set("Content-Length", strconv.Itoa(link.Size))
 	}
 	if link.IsChunked() {
 		w.Header().Set("X-Telconyx-Chunks", strconv.Itoa(len(link.AllChunks())))
 	}
-	// On success the body is the raw file stream (not enveloped). If DownloadTo
-	// fails after headers/bytes are already written, we can only abort; the
+	// On success the body is the raw file stream (not enveloped). Failures
+	// before the first body byte (expired file_id, wrong bot, Telegram down)
+	// can still produce a proper JSON error — headers above are not flushed
+	// until the first write. After the first byte we can only abort; the
 	// client sees a truncated response.
-	if _, err := h.store.DownloadTo(r.Context(), link, w); err != nil {
+	cw := &countingWriter{w: w}
+	if _, err := h.store.DownloadTo(r.Context(), link, cw); err != nil {
+		if cw.n == 0 {
+			hdr := w.Header()
+			hdr.Del("Content-Length")
+			hdr.Del("Content-Disposition")
+			hdr.Del("X-Telconyx-Chunks")
+			writeError(w, r, http.StatusBadGateway, "download_failed", err.Error())
+		}
 		return
 	}
+}
+
+// countingWriter counts bytes written so the download handler can tell
+// "failed before the first byte" (recoverable into a JSON error) apart from
+// "failed mid-stream" (only abortable).
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // writeUnresolvable maps a Resolve failure to an error response: a link whose

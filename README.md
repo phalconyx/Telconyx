@@ -6,7 +6,7 @@
 
 - **Stdlib only** — zero third-party dependencies, just Go + `net/http`.
 - **Stateless bridge** — Telconyx does not store anything. You save the link in your own database.
-- **Chunked uploads** — files larger than the configurable chunk size (`ChunkSize`, default 49 MB, max 50 MB) are split into multiple parts and reassembled in parallel on download.
+- **Chunked uploads** — files larger than the configurable chunk size (`ChunkSize`, default 19 MB, max 50 MB) are split into multiple parts and reassembled in parallel on download.
 - **One binary, two modes** — `import` as a Go library, or run as an HTTP service on `:9090`.
 - **Tiny Docker image** — multi-stage build, distroless base, ~8 MB.
 - **Resilient** — built-in flood-wait retry, exponential backoff with jitter, context cancellation, per-chunk retry.
@@ -65,7 +65,7 @@ client, _ := telconyx.NewClient(telconyx.Config{
     ChatID:        "-1001234567890",
     MaxUploadSize:  2 * 1024 * 1024 * 1024, // 2 GB (default)
     MaxDownloadSize: 2 * 1024 * 1024 * 1024,
-    ChunkSize:       49 * 1024 * 1024, // default
+    ChunkSize:       19 * 1024 * 1024, // default; keep under 20 MB on the hosted API
     ChunkConcurrency: 3,              // default
 })
 
@@ -89,6 +89,7 @@ client.Download(ctx, link, "big-backup.tar.gz")
 telconyx serve                     Run HTTP server (default :9090)
 telconyx upload <file>             Upload a file, print the telconyx:// link to stdout
 telconyx download <url> <dest>     Download a file by telconyx:// URL
+telconyx healthcheck               Probe the local server's /health (used by the Docker healthcheck)
 telconyx version                   Print version
 telconyx help                      Show usage
 ```
@@ -101,12 +102,13 @@ Environment variables:
 | `TELCONYX_CHAT_ID`          | yes*     | —        | Target chat ID (`-100...`) or `@name` (*or use `TELCONYX_ROUTES`)    |
 | `TELCONYX_ROUTES`           | no       | —        | Multiple bot/chat routes: `alias=token@chat_id,...` (see [Scaling](#scaling-multiple-bots-and-routing)) |
 | `TELCONYX_DEFAULT_ROUTE`    | no       | first route | Route alias assumed for links without a route marker              |
+| `TELCONYX_API_BASE`         | no       | `https://api.telegram.org` | Bot API server root; set a [self-hosted server](#file-size-limits-and-self-hosting) to lift the 20MB download limit |
 | `TELCONYX_API_KEY`          | no       | empty    | API key for HTTP server auth                                         |
 | `TELCONYX_LISTEN`           | no       | `:9090`  | Server listen address                                                |
-| `TELCONYX_TIMEOUT`          | no       | `60s`    | Per-request HTTP timeout                                             |
+| `TELCONYX_TIMEOUT`          | no       | `60s`    | HTTP connection/response-header timeout (body transfer is never time-limited) |
 | `TELCONYX_MAX_UPLOAD_SIZE`  | no       | `2GB`    | Max total file size for upload (e.g. `500MB`, `2GB`)                 |
 | `TELCONYX_MAX_DOWNLOAD_SIZE`| no       | `2GB`    | Max total file size for download                                     |
-| `TELCONYX_CHUNK_SIZE`       | no       | `49MB`   | Chunk size for split uploads (max 50MB)                              |
+| `TELCONYX_CHUNK_SIZE`       | no       | `19MB`   | Chunk size for split uploads (max 50MB; keep under 20MB on the hosted API) |
 | `TELCONYX_CHUNK_CONCURRENCY`| no       | `3`      | Number of concurrent chunk downloads                                 |
 
 Size suffixes are all **binary** (powers of 1024): `B`, `K`/`KB`, `M`/`MB`, `G`/`GB` all use 1024. So `49MB` = 49 × 1024 × 1024 bytes. This matches the on-disk byte count of files. For an exact decimal byte count, pass a bare number (e.g. `49000000`).
@@ -127,7 +129,7 @@ All JSON responses share a consistent envelope. **The HTTP status code is author
 { "error": { "code": "invalid_link", "message": "human-readable detail" }, "meta": { "request_id": "req_8f2a1c..." } }
 ```
 
-`error.code` is a stable, machine-readable identifier (`unauthorized`, `invalid_json`, `missing_url`, `invalid_link`, `unknown_route`, `missing_file`, `invalid_multipart`, `upload_failed`, `delete_failed`, `internal`); `error.message` is for humans. Every response also carries an `X-Request-Id` header echoing `meta.request_id` — send your own `X-Request-Id` to propagate a trace id. The only non-JSON response is a successful `/download`, which streams raw file bytes.
+`error.code` is a stable, machine-readable identifier (`unauthorized`, `invalid_json`, `missing_url`, `invalid_link`, `unknown_route`, `missing_file`, `invalid_multipart`, `upload_failed`, `upload_too_large`, `download_failed`, `delete_failed`, `internal`); `error.message` is for humans. Every response also carries an `X-Request-Id` header echoing `meta.request_id` — send your own `X-Request-Id` to propagate a trace id. The only non-JSON response is a successful `/download`, which streams raw file bytes.
 
 `GET /health`
 
@@ -191,7 +193,7 @@ curl -X POST http://localhost:9090/download \
   -OJ
 ```
 
-Response: on success, the **raw file bytes** (not enveloped), with `Content-Type`, `Content-Disposition: attachment; filename="..."` and (for chunked files) `X-Telconyx-Chunks: N` headers when known. The real filename and type come from these headers — the output filename you pass to curl (`-o`) is just a local choice and does not have to match. Errors that occur *before* streaming begins (bad request, unknown link) use the standard JSON error envelope.
+Response: on success, the **raw file bytes** (not enveloped), with `Content-Type`, `Content-Disposition: attachment; filename="..."` and (for chunked files) `X-Telconyx-Chunks: N` headers when known. The real filename and type come from these headers — the output filename you pass to curl (`-o`) is just a local choice and does not have to match. Errors that occur *before* the first body byte (bad request, unknown link, expired `file_id`, Telegram unreachable) use the standard JSON error envelope (`download_failed`); a failure after streaming has begun can only abort the connection, which the client sees as a truncated body.
 
 `POST /delete` (application/json)
 
@@ -214,13 +216,14 @@ Response `200 OK`:
 Deletes the Telegram message(s) backing the file. For chunked files every part is removed. Notes:
 
 - Requires a **numeric** `TELCONYX_CHAT_ID` (not `@username`) — otherwise the request returns an error.
+- If the link records a chat id that differs from the configured chat, the request is refused: Telegram message ids are chat-specific, and deleting them in a different chat would hit unrelated messages.
 - The bot can only delete its own messages, and Telegram only allows deletion within a limited window (commonly ~48 hours); older files may return `400 Bad Request: message can't be deleted`.
 - `skipped` counts parts whose Telegram message id is not stored in the link. Links created before this feature only carry the **first** chunk's message id, so only that part can be deleted — re-upload to get a fully deletable link.
 - On failure some parts may already have been deleted (deletion is attempted for every part; the first error is returned).
 
 ## Chunking
 
-Telegram's Bot API caps each file at **50 MB** for `sendDocument`. Telconyx automatically splits larger files into chunks of `ChunkSize` bytes (default 49 MB to leave headroom for multipart overhead) and uploads each as a separate message.
+The hosted Bot API has **asymmetric** file-size limits: bots may *send* files up to **50 MB** (`sendDocument`) but may only *download* files up to **20 MB** (`getFile`). Storage that cannot be read back is useless, so Telconyx splits files into chunks of `ChunkSize` bytes with a default of **19 MB** — under the download limit, with headroom — and uploads each as a separate message. See [File size limits and self-hosting](#file-size-limits-and-self-hosting) for raising these limits.
 
 On download:
 - The library uses up to `ChunkConcurrency` workers (default 3) to fetch chunks in parallel via `WriteAt`, so reassembly is fast.
@@ -277,14 +280,28 @@ pool.Download(ctx, link, "big-backup.tar.gz")          // routed to the origin b
 
 `Pool` exposes the same operations as `Client`, so `server.New` accepts either.
 
-## Limits
+## File size limits and self-hosting
 
 | Limit                          | Default      | Configurable       |
 |--------------------------------|--------------|--------------------|
-| Per-chunk upload size          | 50 MB (Bot API) | `ChunkSize` (capped at 50 MB) |
+| Per-chunk upload size          | 50 MB (Bot API `sendDocument`) | `ChunkSize` (capped at 50 MB) |
+| Per-chunk download size        | 20 MB (hosted Bot API `getFile`) | lifted by a self-hosted API server |
+| Default chunk size             | 19 MB        | `ChunkSize`        |
 | Total file size for upload     | 2 GB         | `MaxUploadSize`    |
 | Total file size for download   | 2 GB         | `MaxDownloadSize`  |
 | Concurrent chunk downloads     | 3            | `ChunkConcurrency` |
+
+The binding constraint on the hosted API is the **20 MB `getFile` download limit** — that is why the default `ChunkSize` is 19 MB. To lift it, run a [self-hosted Bot API server](https://github.com/tdlib/telegram-bot-api) and point Telconyx at it:
+
+```bash
+TELCONYX_API_BASE=http://localhost:8081
+TELCONYX_CHUNK_SIZE=49MB   # now safe: self-hosted getFile serves large files
+```
+
+Two caveats:
+
+- Files uploaded with chunks **larger than 20 MB** (e.g. with the old 49 MB default) cannot be downloaded through the hosted API at all — only a self-hosted API server can retrieve them. Links themselves stay valid; it is purely a retrieval-path limitation.
+- A quick way to validate your setup end to end: upload a ~25 MB file and download it back (`telconyx upload` / `telconyx download`). If `getFile` answers `400: file is too big`, your chunk size is above what your API endpoint can serve.
 
 ## Project layout
 

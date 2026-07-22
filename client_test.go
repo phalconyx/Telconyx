@@ -282,7 +282,7 @@ func TestParseSize(t *testing.T) {
 }
 
 func TestParseSize_Invalid(t *testing.T) {
-	cases := []string{"", "MB", "abc", "1XB", "MB1"}
+	cases := []string{"", "MB", "abc", "1XB", "MB1", "-5MB", "-1", "inf", "nan", "1e30", "9999999999GB"}
 	for _, c := range cases {
 		if _, err := ParseSize(c); err == nil {
 			t.Errorf("ParseSize(%q) expected error", c)

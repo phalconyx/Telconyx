@@ -2,6 +2,7 @@ package telconyx
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -48,7 +49,14 @@ func ParseSize(s string) (int64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("invalid number %q: %w", numStr, err)
 		}
-		return int64(f * float64(sx.mult)), nil
+		v := f * float64(sx.mult)
+		if math.IsNaN(v) || v < 0 {
+			return 0, fmt.Errorf("size must be a non-negative number, got %q", s)
+		}
+		if v >= math.MaxInt64 {
+			return 0, fmt.Errorf("size %q overflows", s)
+		}
+		return int64(v), nil
 	}
 	return 0, fmt.Errorf("unrecognised size suffix in %q", s)
 }

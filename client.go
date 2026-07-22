@@ -15,9 +15,19 @@ const (
 	// A chunk must not exceed this size.
 	MaxFileSize = 50 * 1024 * 1024
 
+	// MaxBotDownloadSize is the hosted Bot API getFile download limit (20 MB).
+	// Bots can SEND files up to 50 MB but can only DOWNLOAD files up to 20 MB
+	// through api.telegram.org — anything stored in larger pieces cannot be
+	// retrieved. A self-hosted telegram-bot-api server (Config.APIBase) lifts
+	// this limit.
+	MaxBotDownloadSize = 20 * 1024 * 1024
+
 	// DefaultChunkSize is the default chunk size for split uploads.
-	// 49 MB leaves headroom under the 50 MB Bot API limit for multipart overhead.
-	DefaultChunkSize int64 = 49 * 1024 * 1024
+	// 19 MB keeps every chunk under the 20 MB getFile download limit
+	// (MaxBotDownloadSize) with headroom, so files remain downloadable
+	// through the hosted Bot API. With a self-hosted API server, ChunkSize
+	// can be raised up to MaxFileSize.
+	DefaultChunkSize int64 = 19 * 1024 * 1024
 
 	// DefaultMaxFileSize is the default maximum total file size for upload/download.
 	// 2 GB.
@@ -33,13 +43,23 @@ type Config struct {
 	Token string
 	// ChatID is the target chat (numeric ID like "-1001234567890" or "@groupusername").
 	ChatID string
-	// Timeout is the per-request HTTP timeout. Default: 60s.
+	// APIBase is the Bot API server root. Default: "https://api.telegram.org".
+	// Point it at a self-hosted telegram-bot-api server to lift the hosted
+	// API's 20 MB getFile download limit (see MaxBotDownloadSize).
+	APIBase string
+	// Timeout bounds the connection phases of each HTTP request (dial, TLS,
+	// wait for response headers). It does NOT bound body transfer, so slow
+	// large uploads/downloads are never cut off mid-stream; use a context
+	// deadline to bound a whole operation. Default: 60s.
 	Timeout time.Duration
 	// Retries is the maximum number of attempts for retryable errors. Default: 3.
 	Retries int
 	// BackoffBase is the base delay for exponential backoff. Default: 500ms.
 	BackoffBase time.Duration
-	// BackoffMax is the maximum delay between retries. Default: 30s.
+	// BackoffMax is the maximum delay between retries, and also the longest
+	// flood-wait (429 retry_after) that is honoured by sleeping in place — a
+	// longer flood-wait is returned as an error immediately so the caller
+	// (or a Pool, which then reroutes) decides what to do. Default: 30s.
 	BackoffMax time.Duration
 
 	// MaxUploadSize is the maximum total file size in bytes for uploads.
@@ -100,7 +120,7 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	return &Client{
 		cfg: cfg,
-		tp:  transport.New(cfg.Token, cfg.Timeout),
+		tp:  transport.New(cfg.Token, cfg.Timeout, cfg.APIBase),
 	}, nil
 }
 
@@ -164,6 +184,12 @@ func (c *Client) withRetry(ctx context.Context, fn func(ctx context.Context) err
 		var fw *FloodWaitError
 		if errors.As(err, &fw) {
 			delay = fw.Duration()
+			// A flood-wait longer than BackoffMax would starve the caller
+			// (and, in a Pool, block failover to a colder route). Surface it
+			// instead of sleeping; the pool marks the route cooling down.
+			if delay > c.cfg.BackoffMax {
+				return err
+			}
 		} else {
 			delay = backoff(attempt, c.cfg.BackoffBase, c.cfg.BackoffMax)
 		}

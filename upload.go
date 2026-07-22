@@ -146,13 +146,6 @@ func (c *Client) uploadChunked(ctx context.Context, f *os.File, totalSize, chunk
 			return nil, fmt.Errorf("%w: chunk %d size %d", ErrFileTooBig, i, size)
 		}
 
-		// Read exactly this slice from the file. NewSectionReader gives us
-		// an io.Reader that returns EOF after `size` bytes.
-		data, err := io.ReadAll(io.NewSectionReader(f, offset, size))
-		if err != nil {
-			return nil, fmt.Errorf("telconyx: read chunk %d: %w", i, err)
-		}
-
 		// Label every chunk consistently and 1-based so the filename matches the
 		// caption ("part 2/3" → ".part2of3"). Note this is cosmetic only: the
 		// display name in Telegram has no effect on download — reassembly uses
@@ -162,14 +155,19 @@ func (c *Client) uploadChunked(ctx context.Context, f *os.File, totalSize, chunk
 		chunkOpts.Name = fmt.Sprintf("%s.part%dof%d", opts.Name, i+1, chunkCount)
 		chunkOpts.Caption = fmt.Sprintf("telconyx: %s (part %d/%d)", opts.Name, i+1, chunkCount)
 
-		result, err := c.uploadChunkFromBytes(ctx, data, chunkOpts)
+		// Stream the slice straight from the file — no chunk-sized buffer.
+		// NewSectionReader returns EOF after `size` bytes, and a fresh reader
+		// is created per attempt so retries restart from the slice start.
+		result, err := c.uploadWithRetry(ctx, func() (io.Reader, error) {
+			return io.NewSectionReader(f, offset, size), nil
+		}, chunkOpts)
 		if err != nil {
 			err = fmt.Errorf("telconyx: upload chunk %d/%d: %w", i+1, chunkCount, err)
 			if len(chunks) > 0 {
 				return nil, &PartialUploadError{
 					Uploaded: len(chunks),
 					Total:    chunkCount,
-					Link:     partialChunkLink(firstResult, chunks, opts.Name),
+					Link:     partialChunkLink(firstResult, chunks, opts.Name, chunkSize),
 					Err:      err,
 				}
 			}
@@ -198,7 +196,7 @@ func (c *Client) uploadChunked(ctx context.Context, f *os.File, totalSize, chunk
 
 // partialChunkLink builds a FileLink referencing only the chunks that were
 // uploaded before a failure, so they can be removed with DeleteChunks.
-func partialChunkLink(first *UploadResult, chunks []ChunkRef, name string) *FileLink {
+func partialChunkLink(first *UploadResult, chunks []ChunkRef, name string, chunkSize int64) *FileLink {
 	l := &FileLink{
 		FileID:       first.FileID,
 		FileUniqueID: first.FileUniqueID,
@@ -208,16 +206,11 @@ func partialChunkLink(first *UploadResult, chunks []ChunkRef, name string) *File
 		Name:         name,
 	}
 	if len(chunks) > 1 {
+		l.ChunkSize = int(chunkSize)
 		l.ChunkCount = len(chunks)
 		l.Chunks = chunks
 	}
 	return l
-}
-
-func (c *Client) uploadChunkFromBytes(ctx context.Context, data []byte, opts UploadOpts) (*UploadResult, error) {
-	return c.uploadWithRetry(ctx, func() (io.Reader, error) {
-		return bytes.NewReader(data), nil
-	}, int64(len(data)), opts)
 }
 
 // UploadReader reads the entire source into memory then uploads it.
@@ -241,13 +234,12 @@ func (c *Client) UploadReader(ctx context.Context, r io.Reader, opts UploadOpts)
 	}
 	return c.uploadWithRetry(ctx, func() (io.Reader, error) {
 		return bytes.NewReader(data), nil
-	}, int64(len(data)), opts)
+	}, opts)
 }
 
 func (c *Client) uploadWithRetry(
 	ctx context.Context,
 	srcFn func() (io.Reader, error),
-	size int64,
 	opts UploadOpts,
 ) (*UploadResult, error) {
 	var result *UploadResult
@@ -350,7 +342,7 @@ func parseSendDocumentResponse(body []byte, opts UploadOpts, out **UploadResult)
 		return fmt.Errorf("telconyx: decode sendDocument response: %w", err)
 	}
 	if !api.OK {
-		return apiErrorFromResponse(&api)
+		return apiErrorFromResponse(&api, "sendDocument")
 	}
 	var msg telegramMessage
 	if err := json.Unmarshal(api.Result, &msg); err != nil {
@@ -388,13 +380,14 @@ func parseSendDocumentResponse(body []byte, opts UploadOpts, out **UploadResult)
 	return nil
 }
 
-func apiErrorFromResponse(api *apiResponse) error {
+func apiErrorFromResponse(api *apiResponse, method string) error {
 	if api.Parameters.RetryAfter > 0 {
 		return &FloodWaitError{Seconds: api.Parameters.RetryAfter}
 	}
 	return &APIError{
 		Code:        api.ErrorCode,
 		Description: api.Description,
+		Method:      method,
 	}
 }
 
@@ -405,7 +398,7 @@ func parseGetFileResponse(body []byte) (string, error) {
 		return "", fmt.Errorf("telconyx: decode getFile response: %w", err)
 	}
 	if !api.OK {
-		return "", apiErrorFromResponse(&api)
+		return "", apiErrorFromResponse(&api, "getFile")
 	}
 	var result struct {
 		FilePath string `json:"file_path"`
@@ -423,35 +416,48 @@ func parseGetFileResponse(body []byte) (string, error) {
 	return result.FilePath, nil
 }
 
-// DeleteMessage deletes a single message from a chat.
-// Useful for cleaning up partial uploads when a chunked upload fails midway.
+// DeleteMessage deletes a single message from a chat, retrying transient
+// failures. Useful for cleaning up partial uploads when a chunked upload
+// fails midway.
 func (c *Client) DeleteMessage(ctx context.Context, chatID int64, messageID int) error {
 	params := url.Values{}
 	params.Set("chat_id", strconv.FormatInt(chatID, 10))
 	params.Set("message_id", strconv.Itoa(messageID))
 
-	resp, err := c.tp.PostForm(ctx, "deleteMessage", params)
-	if err != nil {
-		return err
-	}
-	var api apiResponse
-	if err := json.Unmarshal(resp.Body, &api); err != nil {
-		return fmt.Errorf("telconyx: decode deleteMessage: %w", err)
-	}
-	if !api.OK {
-		return apiErrorFromResponse(&api)
-	}
-	return nil
+	return c.withRetry(ctx, func(ctx context.Context) error {
+		resp, err := c.tp.PostForm(ctx, "deleteMessage", params)
+		if err != nil {
+			return err
+		}
+		var api apiResponse
+		if err := json.Unmarshal(resp.Body, &api); err != nil {
+			return fmt.Errorf("telconyx: decode deleteMessage: %w", err)
+		}
+		if !api.OK {
+			return apiErrorFromResponse(&api, "deleteMessage")
+		}
+		return nil
+	})
 }
 
 // DeleteChunks deletes all messages of a (chunked) file from the configured chat.
 // It returns the first error encountered but tries to delete every chunk.
 // Use this after a failed upload to remove the partial messages from the group
 // before retrying.
+//
+// Message ids are chat-specific, so when the link records a chat id it must
+// match this client's chat — deleting link message ids in a different chat
+// would hit unrelated messages.
 func (c *Client) DeleteChunks(ctx context.Context, link *FileLink) error {
+	if link == nil {
+		return ErrInvalidLink
+	}
 	chatID, err := strconv.ParseInt(c.cfg.ChatID, 10, 64)
 	if err != nil {
 		return fmt.Errorf("telconyx: DeleteChunks requires a numeric ChatID (got %q)", c.cfg.ChatID)
+	}
+	if link.ChatID != 0 && link.ChatID != chatID {
+		return fmt.Errorf("telconyx: link belongs to chat %d but this client targets chat %d; refusing to delete", link.ChatID, chatID)
 	}
 	var firstErr error
 	for _, ch := range link.AllChunks() {
