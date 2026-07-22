@@ -361,6 +361,39 @@ func TestFakeAPI_OversizeBodyRejected(t *testing.T) {
 	}
 }
 
+// TestFakeAPI_IdlePoolRotatesRoutes proves the least-inflight default picker
+// degrades to round robin when idle: sequential uploads alternate routes
+// instead of sticking to the first one.
+func TestFakeAPI_IdlePoolRotatesRoutes(t *testing.T) {
+	fake := newFakeTelegram(t)
+	p, err := NewPool(PoolConfig{
+		Routes: []Route{
+			{Alias: "b1", Token: "t1", ChatID: "-100500"},
+			{Alias: "b2", Token: "t2", ChatID: "-100500"},
+		},
+		Base: Config{APIBase: fake.URL()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+
+	var routes []string
+	for i := 0; i < 4; i++ {
+		res, err := p.UploadReader(context.Background(), strings.NewReader("rotate"), UploadOpts{Name: "r.txt"})
+		if err != nil {
+			t.Fatalf("upload %d: %v", i, err)
+		}
+		routes = append(routes, res.Route)
+	}
+	want := []string{"b1", "b2", "b1", "b2"}
+	for i := range want {
+		if routes[i] != want[i] {
+			t.Fatalf("upload routes: got %v, want %v", routes, want)
+		}
+	}
+}
+
 // TestFakeAPI_PoolFailsOverOnLongFloodWait proves S5 end to end: a route
 // answering 429 with a huge retry_after is abandoned immediately, the pool
 // reroutes the upload, and the hot route is left cooling down.

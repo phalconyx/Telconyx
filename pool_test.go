@@ -113,6 +113,106 @@ func TestPool_DefaultRouteOverride(t *testing.T) {
 	}
 }
 
+func TestDefaultPickerIsLeastInflight(t *testing.T) {
+	p := newTestPool(t, "b1", "b2")
+	if _, ok := p.picker.(*leastInflight); !ok {
+		t.Errorf("default picker is %T, want *leastInflight", p.picker)
+	}
+}
+
+func TestLeastInflight_PrefersIdleRoute(t *testing.T) {
+	p := newTestPool(t, "b1", "b2", "b3")
+	p.addInflight("b1", 2)
+	p.addInflight("b2", 1)
+	for i := 0; i < 5; i++ {
+		if got := p.pick(nil); got != "b3" {
+			t.Fatalf("pick #%d: got %q, want b3 (the only idle route)", i, got)
+		}
+	}
+	// b3 gets busy too; now b2 is the least loaded.
+	p.addInflight("b3", 3)
+	for i := 0; i < 5; i++ {
+		if got := p.pick(nil); got != "b2" {
+			t.Fatalf("pick #%d: got %q, want b2 (lowest in-flight)", i, got)
+		}
+	}
+	// Load drains: back to full rotation over all three.
+	p.addInflight("b1", -2)
+	p.addInflight("b2", -1)
+	p.addInflight("b3", -3)
+	seen := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		seen[p.pick(nil)] = true
+	}
+	if len(seen) != 3 {
+		t.Errorf("after drain, 3 picks covered %d routes, want all 3 (%v)", len(seen), seen)
+	}
+}
+
+func TestLeastInflight_TieBreakRotates(t *testing.T) {
+	// All idle: behaviour must degrade to pure round robin, never sticking
+	// to the first route (that would concentrate message-rate pressure).
+	p := newTestPool(t, "b1", "b2")
+	want := []string{"b1", "b2", "b1", "b2"}
+	for i, w := range want {
+		if got := p.pick(nil); got != w {
+			t.Fatalf("pick #%d: got %q, want %q (idle pool must rotate)", i, got, w)
+		}
+	}
+}
+
+func TestLeastInflight_CooldownStillFilters(t *testing.T) {
+	p := newTestPool(t, "b1", "b2")
+	p.addInflight("b2", 5) // b2 is busy...
+	p.markCooldown("b1", time.Minute)
+	// ...but b1 is rate-limited, so busy beats flooded.
+	if got := p.pick(nil); got != "b2" {
+		t.Errorf("got %q, want b2 (cooldown filter runs before load comparison)", got)
+	}
+}
+
+func TestUploadFailover_TracksInflight(t *testing.T) {
+	p := newTestPool(t, "b1", "b2")
+	res, err := p.uploadFailover(context.Background(), func(_ context.Context, c *Client) (*UploadResult, error) {
+		alias := poolAliasOf(p, c)
+		p.mu.Lock()
+		n := p.inflight[alias]
+		p.mu.Unlock()
+		if n != 1 {
+			t.Errorf("inflight[%s] during upload: got %d, want 1", alias, n)
+		}
+		return &UploadResult{FileID: "fid"}, nil
+	})
+	if err != nil {
+		t.Fatalf("uploadFailover: %v", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for a, n := range p.inflight {
+		if n != 0 {
+			t.Errorf("inflight[%s] after upload: got %d, want 0", a, n)
+		}
+	}
+	_ = res
+}
+
+func TestUploadFailover_InflightZeroAfterFailure(t *testing.T) {
+	p := newTestPool(t, "b1", "b2")
+	_, err := p.uploadFailover(context.Background(), func(context.Context, *Client) (*UploadResult, error) {
+		return nil, &APIError{Code: 502, Description: "boom"}
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for a, n := range p.inflight {
+		if n != 0 {
+			t.Errorf("inflight[%s] after failed upload: got %d, want 0", a, n)
+		}
+	}
+}
+
 func TestRoundRobin_Cycles(t *testing.T) {
 	rr := NewRoundRobin()
 	aliases := []string{"a", "b", "c"}

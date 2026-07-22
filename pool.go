@@ -42,7 +42,9 @@ type PoolConfig struct {
 	// old links keep resolving. Default: the first route.
 	DefaultRoute string
 
-	// Picker selects the route for each new upload. Default: round robin.
+	// Picker selects the route for each new upload. Default: least-inflight —
+	// the route with the fewest uploads currently in progress, with ties
+	// broken round-robin so an idle pool degrades to pure rotation.
 	Picker Picker
 
 	// Base carries the shared per-client tuning (timeouts, retries, size
@@ -59,8 +61,9 @@ type Picker interface {
 	Pick(aliases []string) string
 }
 
-// NewRoundRobin returns a Picker that cycles through the candidates in order.
-// It is the default Picker of a Pool.
+// NewRoundRobin returns a Picker that cycles through the candidates in order,
+// ignoring load. It is available as an explicit alternative to the default
+// least-inflight picker.
 func NewRoundRobin() Picker { return &roundRobin{} }
 
 type roundRobin struct{ n atomic.Uint64 }
@@ -68,6 +71,36 @@ type roundRobin struct{ n atomic.Uint64 }
 func (r *roundRobin) Pick(aliases []string) string {
 	i := r.n.Add(1) - 1
 	return aliases[i%uint64(len(aliases))]
+}
+
+// leastInflight is the default Picker: it selects the candidate with the
+// fewest uploads currently in flight. Uploads here are long-lived and wildly
+// heterogeneous (a 1 KB note vs a 2 GB chunked file), so counting active
+// uploads is a good proxy for how much message-rate pressure a route is about
+// to generate. Ties — including the all-idle case — are broken round-robin,
+// so a quiet pool behaves exactly like plain rotation.
+type leastInflight struct {
+	p *Pool
+	n atomic.Uint64 // tie-break rotation
+}
+
+func (l *leastInflight) Pick(aliases []string) string {
+	l.p.mu.Lock()
+	ties := make([]string, 0, len(aliases))
+	min := 0
+	for i, a := range aliases {
+		n := l.p.inflight[a]
+		if i == 0 || n < min {
+			min = n
+			ties = ties[:0]
+		}
+		if n == min {
+			ties = append(ties, a)
+		}
+	}
+	l.p.mu.Unlock()
+	i := l.n.Add(1) - 1
+	return ties[i%uint64(len(ties))]
 }
 
 // Pool distributes uploads over multiple routes (bot + chat pairs) and routes
@@ -81,6 +114,7 @@ type Pool struct {
 
 	mu        sync.Mutex
 	coolUntil map[string]time.Time // flood-wait cooldown per alias
+	inflight  map[string]int       // uploads in progress per alias
 }
 
 // NewPool creates a Pool from cfg.
@@ -91,10 +125,11 @@ func NewPool(cfg PoolConfig) (*Pool, error) {
 	p := &Pool{
 		clients:   make(map[string]*Client, len(cfg.Routes)),
 		coolUntil: make(map[string]time.Time),
+		inflight:  make(map[string]int),
 		picker:    cfg.Picker,
 	}
 	if p.picker == nil {
-		p.picker = NewRoundRobin()
+		p.picker = &leastInflight{p: p}
 	}
 	for _, rt := range cfg.Routes {
 		if rt.Alias == "" && len(cfg.Routes) > 1 {
@@ -265,7 +300,9 @@ func (p *Pool) uploadFailover(ctx context.Context, up func(context.Context, *Cli
 		alias := p.pick(tried)
 		tried[alias] = true
 
+		p.addInflight(alias, 1)
 		res, err := up(ctx, p.clients[alias])
+		p.addInflight(alias, -1)
 		if err == nil {
 			res.Route = alias
 			return res, nil
@@ -321,6 +358,14 @@ func (p *Pool) pick(tried map[string]bool) string {
 		avail = p.order
 	}
 	return p.picker.Pick(avail)
+}
+
+// addInflight adjusts the number of uploads in progress on a route; the
+// default least-inflight picker reads these counters.
+func (p *Pool) addInflight(alias string, delta int) {
+	p.mu.Lock()
+	p.inflight[alias] += delta
+	p.mu.Unlock()
 }
 
 // markCooldown excludes a route from picking for d, extending (never

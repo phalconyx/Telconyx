@@ -257,7 +257,7 @@ TELCONYX_ROUTES='b1=1234:ABC@-1001111111111,b2=5678:DEF@-1002222222222'
 
 Two routes may share a token with different chats (raises the per-chat ceiling) or use different tokens (raises the per-bot ceiling).
 
-**How routing works.** Uploads rotate across routes — round robin, automatically skipping routes that are in a flood-wait (429) cooldown, and failing over to the next route when a route errors before anything was stored. A Telegram `file_id` is only valid for the bot that uploaded it, so each `telconyx://` link records its route alias, and downloads/deletes are always routed back to the origin bot. All chunks of one file go through a single route.
+**How routing works.** Each upload goes to the route with the fewest uploads currently in flight (**least-inflight**); ties rotate round-robin, so an idle pool cycles evenly. Routes in a flood-wait (429) cooldown are skipped automatically, and an upload fails over to the next route when a route errors before anything was stored. A Telegram `file_id` is only valid for the bot that uploaded it, so each `telconyx://` link records its route alias, and downloads/deletes are always routed back to the origin bot. All chunks of one file go through a single route.
 
 **Aliases are permanent.** The alias is stored inside every link created through it (Telconyx itself stays stateless — no database). Renaming or removing an alias breaks the links that reference it; the server then returns `400 unknown_route`. Adding new routes is always safe.
 
@@ -271,7 +271,8 @@ pool, _ := telconyx.NewPool(telconyx.PoolConfig{
         {Alias: "b1", Token: "1234:ABC", ChatID: "-1001111111111"},
         {Alias: "b2", Token: "5678:DEF", ChatID: "-1002222222222"},
     },
-    // Picker: custom strategy; default is round robin with flood-wait cooldown.
+    // Picker: custom strategy; default is least-inflight with round-robin
+    // tie-break, plus flood-wait cooldown. NewRoundRobin() forces plain rotation.
 })
 result, _ := pool.UploadFile(ctx, "big-backup.tar.gz") // picks a route
 link, _ := telconyx.ParseURL(result.Link())
@@ -308,7 +309,7 @@ Two caveats:
 ```text
 telconyx/
 ├── client.go                Client, Config, retry, defaults
-├── pool.go                  Pool, Route, Picker (round robin + flood-wait cooldown)
+├── pool.go                  Pool, Route, Picker (least-inflight + flood-wait cooldown)
 ├── upload.go                UploadFile (chunked), UploadReader
 ├── download.go              Download (parallel), DownloadTo
 ├── link.go                  FileLink, ChunkRef, telconyx:// codec
