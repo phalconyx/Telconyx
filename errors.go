@@ -17,6 +17,9 @@ var (
 	ErrInvalidConfig    = errors.New("telconyx: invalid config")
 	ErrInvalidLink      = errors.New("telconyx: invalid telconyx:// link")
 	ErrUnauthorized     = errors.New("telconyx: unauthorized")
+	// ErrUnknownRoute indicates a link references a route alias that is not
+	// configured in the Pool serving the request.
+	ErrUnknownRoute = errors.New("telconyx: link references an unknown route")
 )
 
 // APIError represents a non-success response from the Telegram Bot API.
@@ -55,6 +58,27 @@ func (e *NonRetryableError) Error() string {
 		return fmt.Sprintf("telconyx: %s (non-retryable)", e.Reason)
 	}
 }
+
+// PartialUploadError reports a chunked upload that failed after at least one
+// chunk was already sent to the chat. Link references the sent chunks so they
+// can be removed with DeleteChunks before retrying; retrying the upload
+// without cleanup duplicates those chunks in the chat.
+type PartialUploadError struct {
+	// Uploaded is the number of chunks successfully sent before the failure.
+	Uploaded int
+	// Total is the number of chunks the complete file would have.
+	Total int
+	// Link references only the sent chunks, for cleanup via DeleteChunks.
+	Link *FileLink
+	// Err is the underlying chunk failure.
+	Err error
+}
+
+func (e *PartialUploadError) Error() string {
+	return fmt.Sprintf("telconyx: chunked upload failed after %d/%d chunks: %v", e.Uploaded, e.Total, e.Err)
+}
+
+func (e *PartialUploadError) Unwrap() error { return e.Err }
 
 // FloodWaitError indicates a rate-limit response (HTTP 429) with retry_after.
 type FloodWaitError struct {

@@ -107,6 +107,19 @@ func NewClient(cfg Config) (*Client, error) {
 // Config returns a copy of the active configuration.
 func (c *Client) Config() Config { return c.cfg }
 
+// MaxUploadSize returns the configured maximum total upload size in bytes.
+func (c *Client) MaxUploadSize() int64 { return c.cfg.MaxUploadSize }
+
+// Resolve verifies the link can be served. A single-bot Client serves every
+// link (it cannot know which route alias it corresponds to); the route-aware
+// check lives on Pool.
+func (c *Client) Resolve(link *FileLink) error {
+	if link == nil {
+		return ErrInvalidLink
+	}
+	return nil
+}
+
 // Close releases any idle HTTP connections held by the underlying transport.
 func (c *Client) Close() {
 	c.tp.Close()

@@ -32,6 +32,13 @@ type FileLink struct {
 	MimeType     string `json:"mime_type,omitempty"`
 	Name         string `json:"name,omitempty"`
 
+	// Route is the alias of the Pool route (bot + chat) that uploaded the
+	// file. Telegram file_ids are only valid for the bot that created them,
+	// so downloads and deletes must go through the same route. Empty for
+	// links created by a single-bot setup; a Pool resolves those to its
+	// default route.
+	Route string `json:"route,omitempty"`
+
 	// Chunking (only present for files split into multiple chunks).
 	ChunkSize  int        `json:"chunk_size,omitempty"`
 	ChunkCount int        `json:"chunk_count,omitempty"`
@@ -48,6 +55,11 @@ type linkPayload struct {
 	S int    `json:"s"`
 	T string `json:"t,omitempty"`
 	N string `json:"n,omitempty"`
+
+	// R is the route alias that uploaded the file (see FileLink.Route).
+	// Absent in links from single-bot setups, which keeps them byte-identical
+	// to links created before routing existed.
+	R string `json:"r,omitempty"`
 
 	// Chunking. F is the first chunk's file_id; CK contains file_ids for all
 	// chunks (including the first, for simplicity), and CM the matching Telegram
@@ -73,6 +85,7 @@ func encodeLink(l *FileLink) (string, error) {
 		S: l.Size,
 		T: l.MimeType,
 		N: l.Name,
+		R: l.Route,
 	}
 	if n := len(l.Chunks); n > 1 {
 		p.CS = l.ChunkSize
@@ -149,6 +162,7 @@ func ParseURL(s string) (*FileLink, error) {
 		Size:         p.S,
 		MimeType:     p.T,
 		Name:         p.N,
+		Route:        p.R,
 	}
 	if p.CC > 1 && len(p.CK) == p.CC {
 		l.ChunkSize = p.CS

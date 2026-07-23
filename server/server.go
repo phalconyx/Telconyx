@@ -19,9 +19,11 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -40,16 +42,27 @@ type Config struct {
 	// except /health.
 	APIKey string
 	// MaxUploadBytes caps the multipart upload body. Default: same as the
-	// client's MaxUploadSize (which itself defaults to 2 GiB).
+	// store's MaxUploadSize (which itself defaults to 2 GiB).
 	MaxUploadBytes int64
 }
 
-// New returns a configured http.Handler.
-func New(c *telconyx.Client, cfg Config) http.Handler {
+// Storage is the subset of telconyx operations the server needs. Both
+// *telconyx.Client (single bot) and *telconyx.Pool (multiple routed bots)
+// implement it.
+type Storage interface {
+	UploadFileHandle(ctx context.Context, f *os.File, size int64, opts telconyx.UploadOpts) (*telconyx.UploadResult, error)
+	DownloadTo(ctx context.Context, link *telconyx.FileLink, w io.Writer) (int64, error)
+	DeleteChunks(ctx context.Context, link *telconyx.FileLink) error
+	Resolve(link *telconyx.FileLink) error
+	MaxUploadSize() int64
+}
+
+// New returns a configured http.Handler backed by store.
+func New(store Storage, cfg Config) http.Handler {
 	if cfg.MaxUploadBytes <= 0 {
-		cfg.MaxUploadBytes = c.Config().MaxUploadSize
+		cfg.MaxUploadBytes = store.MaxUploadSize()
 	}
-	h := &handler{client: c, cfg: cfg}
+	h := &handler{store: store, cfg: cfg}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", h.health)
 	mux.HandleFunc("POST /upload", h.upload)
@@ -59,8 +72,8 @@ func New(c *telconyx.Client, cfg Config) http.Handler {
 }
 
 type handler struct {
-	client *telconyx.Client
-	cfg    Config
+	store Storage
+	cfg   Config
 }
 
 func (h *handler) auth(w http.ResponseWriter, r *http.Request) bool {
@@ -132,7 +145,7 @@ func (h *handler) upload(w http.ResponseWriter, r *http.Request) {
 		MimeType: header.Header.Get("Content-Type"),
 	}
 
-	result, err := h.client.UploadFileHandle(r.Context(), src, written, opts)
+	result, err := h.store.UploadFileHandle(r.Context(), src, written, opts)
 	if err != nil {
 		writeError(w, r, http.StatusBadGateway, "upload_failed", err.Error())
 		return
@@ -169,6 +182,10 @@ func (h *handler) download(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid_link", err.Error())
 		return
 	}
+	if err := h.store.Resolve(link); err != nil {
+		writeUnresolvable(w, r, err)
+		return
+	}
 	if link.MimeType != "" {
 		w.Header().Set("Content-Type", link.MimeType)
 	}
@@ -184,9 +201,20 @@ func (h *handler) download(w http.ResponseWriter, r *http.Request) {
 	// On success the body is the raw file stream (not enveloped). If DownloadTo
 	// fails after headers/bytes are already written, we can only abort; the
 	// client sees a truncated response.
-	if _, err := h.client.DownloadTo(r.Context(), link, w); err != nil {
+	if _, err := h.store.DownloadTo(r.Context(), link, w); err != nil {
 		return
 	}
+}
+
+// writeUnresolvable maps a Resolve failure to an error response: a link whose
+// route alias is not configured on this server gets a dedicated code so the
+// operator knows it is a configuration mismatch, not a bad link.
+func writeUnresolvable(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, telconyx.ErrUnknownRoute) {
+		writeError(w, r, http.StatusBadRequest, "unknown_route", err.Error())
+		return
+	}
+	writeError(w, r, http.StatusBadRequest, "invalid_link", err.Error())
 }
 
 // delete removes the Telegram message(s) backing a telconyx:// file. For chunked
@@ -211,6 +239,10 @@ func (h *handler) delete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusBadRequest, "invalid_link", err.Error())
 		return
 	}
+	if err := h.store.Resolve(link); err != nil {
+		writeUnresolvable(w, r, err)
+		return
+	}
 
 	// Count parts whose message id is known (legacy links only carry the first).
 	chunks := link.AllChunks()
@@ -221,7 +253,7 @@ func (h *handler) delete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.client.DeleteChunks(r.Context(), link); err != nil {
+	if err := h.store.DeleteChunks(r.Context(), link); err != nil {
 		// Some messages may already have been deleted before the failure.
 		writeError(w, r, http.StatusBadGateway, "delete_failed", err.Error())
 		return

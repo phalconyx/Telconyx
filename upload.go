@@ -35,6 +35,10 @@ type UploadResult struct {
 	MimeType     string `json:"mime_type,omitempty"`
 	Name         string `json:"name,omitempty"`
 
+	// Route is the alias of the Pool route that performed the upload.
+	// Empty for uploads through a plain single-bot Client.
+	Route string `json:"route,omitempty"`
+
 	// Chunking (only present if the file was split into multiple chunks).
 	ChunkSize  int        `json:"chunk_size,omitempty"`
 	ChunkCount int        `json:"chunk_count,omitempty"`
@@ -54,6 +58,7 @@ func (r *UploadResult) Link() string {
 		Size:         r.Size,
 		MimeType:     r.MimeType,
 		Name:         r.Name,
+		Route:        r.Route,
 		ChunkSize:    r.ChunkSize,
 		ChunkCount:   r.ChunkCount,
 		Chunks:       r.Chunks,
@@ -159,7 +164,16 @@ func (c *Client) uploadChunked(ctx context.Context, f *os.File, totalSize, chunk
 
 		result, err := c.uploadChunkFromBytes(ctx, data, chunkOpts)
 		if err != nil {
-			return nil, fmt.Errorf("telconyx: upload chunk %d/%d: %w", i+1, chunkCount, err)
+			err = fmt.Errorf("telconyx: upload chunk %d/%d: %w", i+1, chunkCount, err)
+			if len(chunks) > 0 {
+				return nil, &PartialUploadError{
+					Uploaded: len(chunks),
+					Total:    chunkCount,
+					Link:     partialChunkLink(firstResult, chunks, opts.Name),
+					Err:      err,
+				}
+			}
+			return nil, err
 		}
 		if i == 0 {
 			firstResult = result
@@ -180,6 +194,24 @@ func (c *Client) uploadChunked(ctx context.Context, f *os.File, totalSize, chunk
 	res.ChunkCount = chunkCount
 	res.Chunks = chunks
 	return &res, nil
+}
+
+// partialChunkLink builds a FileLink referencing only the chunks that were
+// uploaded before a failure, so they can be removed with DeleteChunks.
+func partialChunkLink(first *UploadResult, chunks []ChunkRef, name string) *FileLink {
+	l := &FileLink{
+		FileID:       first.FileID,
+		FileUniqueID: first.FileUniqueID,
+		MessageID:    first.MessageID,
+		ChatID:       first.ChatID,
+		Size:         chunks[0].Size,
+		Name:         name,
+	}
+	if len(chunks) > 1 {
+		l.ChunkCount = len(chunks)
+		l.Chunks = chunks
+	}
+	return l
 }
 
 func (c *Client) uploadChunkFromBytes(ctx context.Context, data []byte, opts UploadOpts) (*UploadResult, error) {

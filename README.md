@@ -97,8 +97,10 @@ Environment variables:
 
 | Variable                    | Required | Default  | Description                                                          |
 |-----------------------------|----------|----------|----------------------------------------------------------------------|
-| `TELCONYX_BOT_TOKEN`        | yes      | —        | Bot token from @BotFather                                            |
-| `TELCONYX_CHAT_ID`          | yes      | —        | Target chat ID (`-100...`) or `@name`                                |
+| `TELCONYX_BOT_TOKEN`        | yes*     | —        | Bot token from @BotFather (*or use `TELCONYX_ROUTES`)                |
+| `TELCONYX_CHAT_ID`          | yes*     | —        | Target chat ID (`-100...`) or `@name` (*or use `TELCONYX_ROUTES`)    |
+| `TELCONYX_ROUTES`           | no       | —        | Multiple bot/chat routes: `alias=token@chat_id,...` (see [Scaling](#scaling-multiple-bots-and-routing)) |
+| `TELCONYX_DEFAULT_ROUTE`    | no       | first route | Route alias assumed for links without a route marker              |
 | `TELCONYX_API_KEY`          | no       | empty    | API key for HTTP server auth                                         |
 | `TELCONYX_LISTEN`           | no       | `:9090`  | Server listen address                                                |
 | `TELCONYX_TIMEOUT`          | no       | `60s`    | Per-request HTTP timeout                                             |
@@ -125,7 +127,7 @@ All JSON responses share a consistent envelope. **The HTTP status code is author
 { "error": { "code": "invalid_link", "message": "human-readable detail" }, "meta": { "request_id": "req_8f2a1c..." } }
 ```
 
-`error.code` is a stable, machine-readable identifier (`unauthorized`, `invalid_json`, `missing_url`, `invalid_link`, `missing_file`, `invalid_multipart`, `upload_failed`, `delete_failed`, `internal`); `error.message` is for humans. Every response also carries an `X-Request-Id` header echoing `meta.request_id` — send your own `X-Request-Id` to propagate a trace id. The only non-JSON response is a successful `/download`, which streams raw file bytes.
+`error.code` is a stable, machine-readable identifier (`unauthorized`, `invalid_json`, `missing_url`, `invalid_link`, `unknown_route`, `missing_file`, `invalid_multipart`, `upload_failed`, `delete_failed`, `internal`); `error.message` is for humans. Every response also carries an `X-Request-Id` header echoing `meta.request_id` — send your own `X-Request-Id` to propagate a trace id. The only non-JSON response is a successful `/download`, which streams raw file bytes.
 
 `GET /health`
 
@@ -159,7 +161,7 @@ Response `201 Created`:
 }
 ```
 
-For chunked uploads, `data` also includes `chunk_size`, `chunk_count`, and a `chunks` array:
+In multi-route mode (`TELCONYX_ROUTES`), `data` also includes `route` — the alias of the route that stored the file. For chunked uploads, `data` also includes `chunk_size`, `chunk_count`, and a `chunks` array:
 
 ```json
 {
@@ -241,6 +243,40 @@ if err := client.DeleteChunks(ctx, link); err != nil {
 
 `DeleteChunks` requires a numeric `ChatID` (not `@groupusername`) and deletes every message referenced in the link. After cleanup, retry the upload. The same operation is exposed over HTTP as `POST /delete` (see [HTTP API](#http-api-server-mode)).
 
+## Scaling: multiple bots and routing
+
+Telegram rate limits apply per **bot** (~30 msg/s overall) and per **chat** (~20 msg/min in a group). To spread load, configure multiple routes — each a `(alias, bot token, chat)` triple:
+
+```bash
+TELCONYX_ROUTES='b1=1234:ABC@-1001111111111,b2=5678:DEF@-1002222222222'
+# For a @username chat, keep its "@":  b3=5678:DEF@@mygroup
+```
+
+Two routes may share a token with different chats (raises the per-chat ceiling) or use different tokens (raises the per-bot ceiling).
+
+**How routing works.** Uploads rotate across routes — round robin, automatically skipping routes that are in a flood-wait (429) cooldown, and failing over to the next route when a route errors before anything was stored. A Telegram `file_id` is only valid for the bot that uploaded it, so each `telconyx://` link records its route alias, and downloads/deletes are always routed back to the origin bot. All chunks of one file go through a single route.
+
+**Aliases are permanent.** The alias is stored inside every link created through it (Telconyx itself stays stateless — no database). Renaming or removing an alias breaks the links that reference it; the server then returns `400 unknown_route`. Adding new routes is always safe.
+
+**Migrating from a single bot.** Links created before routing carry no alias; a multi-route server resolves them to `TELCONYX_DEFAULT_ROUTE` (default: the first route). Keep your original bot+chat as that route and all old links keep working — single-bot setups also still emit byte-identical links, so nothing changes until you opt in.
+
+As a library, the same is available via `telconyx.NewPool`:
+
+```go
+pool, _ := telconyx.NewPool(telconyx.PoolConfig{
+    Routes: []telconyx.Route{
+        {Alias: "b1", Token: "1234:ABC", ChatID: "-1001111111111"},
+        {Alias: "b2", Token: "5678:DEF", ChatID: "-1002222222222"},
+    },
+    // Picker: custom strategy; default is round robin with flood-wait cooldown.
+})
+result, _ := pool.UploadFile(ctx, "big-backup.tar.gz") // picks a route
+link, _ := telconyx.ParseURL(result.Link())
+pool.Download(ctx, link, "big-backup.tar.gz")          // routed to the origin bot
+```
+
+`Pool` exposes the same operations as `Client`, so `server.New` accepts either.
+
 ## Limits
 
 | Limit                          | Default      | Configurable       |
@@ -255,10 +291,11 @@ if err := client.DeleteChunks(ctx, link); err != nil {
 ```text
 telconyx/
 ├── client.go                Client, Config, retry, defaults
+├── pool.go                  Pool, Route, Picker (round robin + flood-wait cooldown)
 ├── upload.go                UploadFile (chunked), UploadReader
 ├── download.go              Download (parallel), DownloadTo
 ├── link.go                  FileLink, ChunkRef, telconyx:// codec
-├── errors.go                APIError, FloodWaitError, ErrUploadTooLarge, ...
+├── errors.go                APIError, FloodWaitError, PartialUploadError, ...
 ├── client_test.go
 ├── internal/transport/      raw HTTP (multipart, streaming)
 ├── server/                  net/http handlers (port 9090)

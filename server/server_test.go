@@ -19,6 +19,18 @@ func newTestHandler(t *testing.T, apiKey, chatID string) http.Handler {
 	return New(c, Config{APIKey: apiKey})
 }
 
+func newTestPoolHandler(t *testing.T) http.Handler {
+	t.Helper()
+	p, err := telconyx.NewPool(telconyx.PoolConfig{Routes: []telconyx.Route{
+		{Alias: "b1", Token: "t1", ChatID: "-100"},
+		{Alias: "b2", Token: "t2", ChatID: "-200"},
+	}})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	return New(p, Config{})
+}
+
 func do(h http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	w := httptest.NewRecorder()
@@ -65,6 +77,25 @@ func TestDelete_NonNumericChatID(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "numeric") {
 		t.Errorf("expected numeric-ChatID error, got %s", w.Body.String())
+	}
+}
+
+// TestUnknownRoute verifies a link whose route alias is not configured on
+// this server gets a 400 with the dedicated unknown_route code — on both
+// endpoints that resolve links, and before any Telegram call is made.
+func TestUnknownRoute(t *testing.T) {
+	h := newTestPoolHandler(t)
+	link := (&telconyx.FileLink{FileID: "fid", MessageID: 5, Route: "ghost"}).URL()
+	for _, path := range []string{"/download", "/delete"} {
+		t.Run(path, func(t *testing.T) {
+			w := do(h, "POST", path, `{"url":"`+link+`"}`)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("got %d, want 400 (body=%s)", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "unknown_route") {
+				t.Errorf("expected unknown_route error code, got %s", w.Body.String())
+			}
+		})
 	}
 }
 
